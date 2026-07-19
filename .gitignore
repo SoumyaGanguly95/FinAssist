@@ -1,0 +1,35 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Secrets — never commit real credentials
+.env
+
+# Local database
+*.db
+*.sqlite
+*.sqlite3
+
+# Raw statement files — may contain real financial data, audit-trail only locally.
+# Azure deployment uses Blob Storage instead, so these never need to be in git.
+data/raw/*
+!data/raw/.gitkeep
+data/processed/*
+!data/processed/.gitkeep
+
+# Test/tooling caches
+.pytest_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Editor
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
