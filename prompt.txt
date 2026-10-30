@@ -1,0 +1,788 @@
+prompt.txt>>
+
+"""
+All agent logic in one file: the parsing agent (single-pass structured
+extraction), the insight agent's tools, and the insight agent itself
+(multi-step tool-calling). Split into three files only once this grows
+past ~200-300 lines — at MVP size, one file is easier to navigate than
+jumping between agents/parsing_agent.py, agents/tools.py, agents/insight_agent.py.
+
+Uses LangChain 1.0's create_agent (built on LangGraph). See:
+https://docs.langchain.com/oss/python/langchain/agents
+"""
+
+from __future__ import annotations
+
+from langchain.agents import create_agent
+from langchain.tools import tool
+from sqlalchemy import func, select
+
+from models import get_session, Account, TransactionRecord, HoldingRecord
+from schemas import ExtractDocument
+
+# --- Parsing agent -------------------------------------------------------
+# Single-pass structured extraction: statement text in, ParsedStatement out.
+# No tools, no loop — there's no multi-step reasoning needed here.
+
+EXTRACTION_SYSTEM_PROMPT = """You extract facts from the text of a financial
+document (bank, broker, fund, deposit, any country or language).
+
+Rules:
+- Copy, don't interpret. Numbers and dates exactly as written ("1.234,56",
+  "24 Oct 2026"). Never calculate, convert or reformat.
+- kind="event": something that happened on a date (buy, sell, dividend, fee,
+  transfer, interest, capital call). raw_label = the original wording
+  (e.g. "Kauf", "Sparplanausführung").
+- kind="holding": an asset held as of a date (deposit, fund, securities
+  position). ONE holding fact per asset. Put other values (maturity amount,
+  interest rate, maturity date, units) in `attributes`, not as separate facts.
+  amount_raw = principal or market value; date_raw = start or as-of date.
+- kind="balance": opening/closing account balances.
+- evidence.quote: the exact source line(s) the fact came from.
+- Leave a field null if it is absent. Never invent facts.
+- currency: ISO code (EUR, INR). language: ISO code of the document ("en", "de").
+"""
+
+
+def extract_document(raw_text: str, account_hint: str | None = None) -> ExtractDocument:
+    agent = create_agent(
+        model="openai:gpt-4.1-mini",
+        tools=[],
+        system_prompt=EXTRACTION_SYSTEM_PROMPT,
+        response_format=ExtractDocument,
+    )
+    content = f"[Account: {account_hint}]\n\n{raw_text}" if account_hint else raw_text
+    result = agent.invoke({"messages": [{"role": "user", "content": content}]})
+    return result["structured_response"]
+
+
+# --- Insight agent tools ---------------------------------------------------
+# Each tool is a plain function the insight agent can choose to call.
+@tool
+def query_positions() -> str:
+    """Return holdings such as fixed deposits and fund positions, with value,
+    currency and details (maturity date, interest rate). Use for questions
+    about deposits, maturities, or non-transaction assets."""
+    with get_session() as session:
+        rows = session.execute(select(HoldingRecord)).scalars().all()
+        if not rows:
+            return "No positions found."
+        return "\n".join(
+            f"{r.instrument_name} ({r.asset_class}): {r.value} {r.currency}, "
+            f"as of {r.as_of_date}, {r.details}" for r in rows
+        )
+
+@tool
+def query_holdings(account_name: str | None = None) -> str:
+    """Return current holdings, optionally filtered to one account. Use
+    this when the user asks what they own, their allocation, or anything
+    about specific instruments/positions."""
+    with get_session() as session:
+        stmt = select(
+            TransactionRecord.instrument_name,
+            TransactionRecord.asset_class,
+            func.sum(TransactionRecord.quantity).label("net_quantity"),
+        ).group_by(TransactionRecord.instrument_name, TransactionRecord.asset_class)
+        if account_name:
+            stmt = stmt.join(TransactionRecord.account).where(Account.name == account_name)
+        rows = session.execute(stmt).all()
+        if not rows:
+            return "No holdings found."
+        return "\n".join(
+            f"{r.instrument_name or 'unnamed'} ({r.asset_class}): {r.net_quantity}" for r in rows
+        )
+
+
+@tool
+def get_portfolio_valuation() -> str:
+    """Return the total portfolio value / net cash flow summary. Use this
+    when the user asks about total value, growth, or overall performance."""
+    with get_session() as session:
+        total = session.execute(select(func.sum(TransactionRecord.amount))).scalar_one_or_none()
+        return f"Net cash flow across all recorded transactions: {total or 0}"
+
+
+@tool
+def flag_anomaly(description: str, reason: str) -> str:
+    """Record a potential anomaly for human review (e.g. an unexpected
+    fee, a duplicate-looking transaction). Does not take destructive
+    action — only logs the flag."""
+    print(f"[ANOMALY FLAGGED] {description} — {reason}")
+    return "Anomaly recorded for review."
+
+INSIGHT_TOOLS = [query_holdings, get_portfolio_valuation, flag_anomaly, query_positions]
+
+# --- Insight agent --------------------------------------------------------
+# Multi-step, tool-calling agent — this is the piece that actually needs
+# LangGraph's loop (decide which tool to call, inspect result, decide again).
+
+INSIGHT_SYSTEM_PROMPT = """You are a financial insight assistant for a
+single user's personal investment portfolio. Answer questions using the
+tools available to you — do not guess numbers. If a question requires
+data you don't have a tool for, say so rather than fabricating an answer.
+Be concise. This is not financial advice; if the user asks for a
+recommendation, frame your answer as information to help them decide,
+not as a directive.
+"""
+
+
+def run_insight_query(question: str, thread_id: str = "default") -> str:
+    agent = create_agent(
+        model="openai:gpt-4.1-mini",
+        tools=INSIGHT_TOOLS,
+        system_prompt=INSIGHT_SYSTEM_PROMPT,
+    )
+    result = agent.invoke(
+        {"messages": [{"role": "user", "content": question}]},
+        config={"configurable": {"thread_id": thread_id}},
+    )
+    return result["messages"][-1].content
+
+app.py>>
+
+"""
+FastAPI service — the web service boundary. This runs on Azure Container Apps.
+dashboard.py is a client of this API, not a container for this logic.
+
+Run locally:
+    uv run uvicorn app:app --reload
+"""
+
+from __future__ import annotations
+
+import uuid
+from pathlib import Path
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, HTTPException, UploadFile
+
+from agents import run_insight_query
+from ingest import commit_parsed_statement, ingest_statement
+from models import init_db
+from schemas import ParsedStatement
+
+
+RAW_DATA_DIR = Path("data/raw")
+RAW_DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    init_db()  # MVP only — use Alembic migrations before real production data
+    yield
+    # Shutdown (optional cleanup)
+    # e.g., close DB connections, release resources
+
+
+app = FastAPI(
+    title="FinAssist API",
+    version="0.1.0",
+    lifespan=lifespan,
+)
+
+
+@app.post("/ingest")
+def ingest(file: UploadFile, account_hint: str | None = None) -> dict:
+    """
+    Parses a statement and returns it for review — does NOT save it.
+    Call /ingest/commit with the same source_file to actually persist it.
+    """
+    suffix = Path(file.filename).suffix
+    saved_path = RAW_DATA_DIR / f"{uuid.uuid4().hex}{suffix}"
+    saved_path.write_bytes(file.file.read()) 
+
+    try:
+        parsed = ingest_statement(str(saved_path), account_hint=account_hint)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+    return {"parsed": parsed, "source_file": str(saved_path)}
+
+
+@app.post("/ingest/commit")
+def commit(parsed: ParsedStatement, source_file: str):
+    """
+    Explicit save step, called after the client has reviewed /ingest's
+    response and confirms it's correct.
+    """
+    return commit_parsed_statement(parsed, source_file=source_file)
+
+
+@app.get("/ask")
+def ask(question: str):
+    return {"question": question, "answer": run_insight_query(question)}
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
+
+config.py>>
+
+"""Single place where environment config is loaded and read."""
+import os
+
+from dotenv import load_dotenv
+
+# --- session setup -----------------------------------------------------
+# Local dev:  DATABASE_URL=sqlite:///data/finassist.db
+# Azure:      DATABASE_URL=mssql+pyodbc://<user>:<pass>@<server>.database.windows.net/finassist?driver=ODBC+Driver+18+for+SQL+Server
+
+load_dotenv()  # no-op for variables already set (e.g. on Azure)
+
+DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///data/finassist.db")
+FINASSIST_API_URL = os.environ.get("FINASSIST_API_URL", "http://localhost:8000")
+
+dashboard.py>>
+
+"""
+Streamlit client — thin by design. All logic lives in app.py/agents.py/
+ingest.py; this file only makes HTTP calls and renders results.
+
+Run (with the API running separately: uv run uvicorn app:app --reload):
+    uv run streamlit run dashboard.py
+"""
+
+import os
+
+import requests
+import streamlit as st
+
+API_BASE = os.environ.get("FINASSIST_API_URL", "http://localhost:8000")
+
+st.set_page_config(page_title="FinAssist", layout="wide")
+st.title("FinAssist")
+
+tab_ingest, tab_ask = st.tabs(["Ingest statement", "Ask a question"])
+
+with tab_ingest:
+    uploaded = st.file_uploader("Upload a statement (PDF or CSV)", type=["pdf", "csv"])
+    account_hint = st.text_input("Account (optional)", placeholder="e.g. Trade Republic")
+
+    if uploaded and st.button("Parse"):
+        with st.spinner("Parsing statement..."):
+            resp = requests.post(
+                f"{API_BASE}/ingest",
+                files={"file": (uploaded.name, uploaded.getvalue())},
+                params={"account_hint": account_hint} if account_hint else {},
+                timeout=120,
+            )
+        if resp.ok:
+            data = resp.json()
+            st.session_state["last_parsed"] = data
+
+            parsed = data["parsed"]
+            for w in parsed["warnings"]:
+                st.warning(w)
+            if parsed["transactions"]:
+                st.subheader("Transactions")
+                st.dataframe(parsed["transactions"])
+            if parsed["positions"]:
+                st.subheader("Positions")
+                st.dataframe(parsed["positions"])
+        else:
+            st.error(resp.json().get("detail", "Parsing failed"))
+
+    if "last_parsed" in st.session_state:
+        st.divider()
+        st.caption("Review the parsed result above, then confirm to save.")
+        if st.button("Confirm and save to database"):
+            data = st.session_state["last_parsed"]
+            commit_resp = requests.post(
+                f"{API_BASE}/ingest/commit",
+                json=data["parsed"],
+                params={"source_file": data["source_file"]},
+            )
+            if commit_resp.ok:
+                st.success(commit_resp.json())
+                del st.session_state["last_parsed"]
+            else:
+                st.error(commit_resp.text)
+
+with tab_ask:
+    question = st.text_input("Ask about your portfolio")
+    if question and st.button("Ask"):
+        with st.spinner("Thinking..."):
+            resp = requests.get(f"{API_BASE}/ask", params={"question": question})
+        if resp.ok:
+            st.write(resp.json()["answer"])
+        else:
+            st.error(resp.text)
+
+ingest.py>>
+
+"""
+Ingestion pipeline: extract text -> parse via agent -> (separately) persist
+to the database. Two distinct functions on purpose — ingest_statement()
+only parses and returns data for review; commit_parsed_statement() is the
+explicit "yes, save this" step. Never auto-chain them — see README.md on
+human-in-the-loop review before financial data is persisted.
+
+This file has no Streamlit or FastAPI imports, so the exact same functions
+are called from app.py (the API), scripts/cli_ingest.py, and later an
+Azure Function triggered by Blob Storage — only the trigger changes.
+"""
+
+from __future__ import annotations
+
+import hashlib
+from pathlib import Path
+
+import pdfplumber
+from sqlalchemy import select
+
+from models import Account, TransactionRecord, get_session
+from schemas import ParsedStatement
+from normalize import normalize
+from models import HoldingRecord
+from agents import extract_document
+
+def extract_text(file_path: str) -> str:
+    """Returns raw text for the parsing agent to interpret.
+
+    PDF: extracted via pdfplumber (statements aren't machine-readable text
+    otherwise).
+    CSV: read as-is and handed to the same agent as raw text. This works
+    for testing, but it's not the efficient long-term approach — CSV data
+    is ALREADY structured, so routing it through an LLM to re-structure it
+    burns tokens for no real gain, and gives the agent a chance to
+    misread a column. Once you know your broker's actual CSV column
+    layout, replace this branch with a deterministic pandas-based parser
+    (see the note in README.md roadmap) — reserve the LLM path for PDFs,
+    where OCR/layout genuinely requires interpretation.
+    """
+    path = Path(file_path)
+    suffix = path.suffix.lower()
+
+    if suffix == ".pdf":
+        text_parts: list[str] = []
+        with pdfplumber.open(path) as pdf:
+            for page in pdf.pages:
+                page_text = page.extract_text()
+                if page_text:
+                    text_parts.append(page_text)
+        return "\n".join(text_parts)
+
+    if suffix == ".csv":
+        return path.read_text(encoding="utf-8", errors="replace")
+
+    raise ValueError(f"extract_text supports .pdf and .csv, got: {suffix}")
+
+
+def ingest_statement(file_path: str, account_hint: str | None = None) -> ParsedStatement:
+    """File in, validated and flagged output out. Does NOT write to the DB."""
+    raw_text = extract_text(file_path)
+    if not raw_text.strip():
+        raise ValueError(f"No extractable text in {file_path}: is it a scanned image?")
+    doc = extract_document(raw_text, account_hint=account_hint)
+    parsed = normalize(doc, raw_text, account_hint or doc.issuer or "Unknown")
+    if not parsed.transactions and not parsed.positions:
+        raise ValueError(f"No transactions or positions found. Warnings: {parsed.warnings}")
+    return parsed
+
+
+def commit_parsed_statement(parsed: ParsedStatement, source_file: str) -> dict:
+    inserted = skipped = holdings_inserted = holdings_skipped = 0
+    with get_session() as session:
+        account = session.execute(
+            select(Account).where(Account.name == parsed.account_name)
+        ).scalar_one_or_none()
+        if account is None:
+            account = Account(name=parsed.account_name)
+            session.add(account)
+            session.flush()
+
+        existing = {r[0] for r in session.execute(
+            select(TransactionRecord.content_hash).where(TransactionRecord.account_id == account.id)
+        ).all()}
+        seen: dict[str, int] = {}
+
+        for txn in parsed.transactions:
+            base = txn.content_hash(parsed.account_name)
+            seen[base] = seen.get(base, 0) + 1
+            content_hash = hashlib.sha256(f"{base}|{seen[base]}".encode()).hexdigest()
+            if content_hash in existing:
+                skipped += 1
+                continue
+            session.add(TransactionRecord(
+                account_id=account.id,
+                transaction_date=txn.transaction_date,
+                transaction_type=txn.transaction_type.value,
+                asset_class=txn.asset_class.value,
+                instrument_name=txn.instrument_name,
+                isin=txn.isin,
+                quantity=txn.quantity,
+                amount=txn.amount,
+                currency=txn.currency,
+                description=txn.description[:500],
+                content_hash=content_hash,
+                source_file=source_file,
+            ))
+            inserted += 1
+
+        existing_holdings = {r[0] for r in session.execute(
+            select(HoldingRecord.content_hash).where(HoldingRecord.account_id == account.id)
+        ).all()}
+
+        for pos in parsed.positions:
+            h = pos.content_hash(parsed.account_name)
+            if h in existing_holdings:
+                holdings_skipped += 1
+                continue
+            session.add(HoldingRecord(
+                account_id=account.id,
+                instrument_name=pos.instrument_name,
+                asset_class=pos.asset_class.value,
+                currency=pos.currency,
+                value=pos.value,
+                as_of_date=pos.as_of_date,
+                details=pos.details,
+                description=pos.description[:500],
+                content_hash=h,
+                source_file=source_file,
+            ))
+            existing_holdings.add(h)
+            holdings_inserted += 1
+
+    return {"inserted": inserted, "skipped_duplicates": skipped,
+            "holdings_inserted": holdings_inserted, "holdings_skipped": holdings_skipped}
+
+models.py>>
+
+"""
+SQLAlchemy models + session setup, combined in one file since this is a
+small, single-tenant project — no need to split ORM classes from engine
+setup until the schema grows past a couple of tables.
+
+DB-agnostic on purpose: no SQLite-specific types, so DATABASE_URL is the
+only thing that changes between local dev (SQLite) and Azure (Azure SQL).
+"""
+
+from __future__ import annotations
+
+import os
+from contextlib import contextmanager
+from datetime import date, datetime
+from decimal import Decimal
+from sqlalchemy import JSON
+
+
+from sqlalchemy import (
+    Date,
+    DateTime,
+    ForeignKey,
+    Numeric,
+    String,
+    UniqueConstraint,
+    create_engine,
+    func,
+)
+from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
+
+from config import DATABASE_URL
+
+class Base(DeclarativeBase):
+    pass
+
+
+class Account(Base):
+    __tablename__ = "accounts"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(100), unique=True)
+    currency: Mapped[str] = mapped_column(String(3), default="EUR")
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+    transactions: Mapped[list["TransactionRecord"]] = relationship(back_populates="account")
+
+class HoldingRecord(Base):
+    __tablename__ = "holdings"
+    __table_args__ = (UniqueConstraint("content_hash", name="uq_holding_content_hash"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    account_id: Mapped[int] = mapped_column(ForeignKey("accounts.id"))
+    instrument_name: Mapped[str] = mapped_column(String(255))
+    asset_class: Mapped[str] = mapped_column(String(20))
+    currency: Mapped[str] = mapped_column(String(3))
+    value: Mapped[Decimal] = mapped_column(Numeric(18, 2))
+    as_of_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    details: Mapped[dict] = mapped_column(JSON, default=dict)
+    description: Mapped[str] = mapped_column(String(500))
+    content_hash: Mapped[str] = mapped_column(String(64), index=True)
+    source_file: Mapped[str] = mapped_column(String(500))
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+class TransactionRecord(Base):
+    __tablename__ = "transactions"
+    __table_args__ = (UniqueConstraint("content_hash", name="uq_transaction_content_hash"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    account_id: Mapped[int] = mapped_column(ForeignKey("accounts.id"))
+    transaction_date: Mapped[date] = mapped_column(Date)
+    transaction_type: Mapped[str] = mapped_column(String(20))
+    asset_class: Mapped[str] = mapped_column(String(20))
+    instrument_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    isin: Mapped[str | None] = mapped_column(String(12), nullable=True)
+    quantity: Mapped[float | None] = mapped_column(Numeric(18, 6), nullable=True)
+    amount: Mapped[float] = mapped_column(Numeric(18, 2))
+    currency: Mapped[str] = mapped_column(String(3))
+    description: Mapped[str] = mapped_column(String(500))
+    content_hash: Mapped[str] = mapped_column(String(64), index=True)
+    source_file: Mapped[str] = mapped_column(String(500))  # audit trail
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+    account: Mapped["Account"] = relationship(back_populates="transactions")
+
+engine = create_engine(DATABASE_URL, echo=False)
+SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
+
+
+def init_db() -> None:
+    """Create tables if they don't exist. Fine for MVP; move to Alembic
+    migrations before this touches real production data."""
+    Base.metadata.create_all(engine)
+
+
+@contextmanager
+def get_session():
+    session: Session = SessionLocal()
+    try:
+        yield session
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
+
+normalize.py>>
+
+import re
+from decimal import Decimal
+from datetime import date, datetime
+from schemas import (AssetClass, ExtractDocument, ParsedStatement, Position,
+                     RawFact, Transaction, TransactionType)
+from verify import verify_fact
+
+DATE_FORMATS = {
+    "de": ["%d.%m.%Y", "%d.%m.%y", "%Y-%m-%d"],
+    "en": ["%d %b %Y", "%d %B %Y", "%Y-%m-%d", "%d/%m/%Y"],
+}
+
+EVENT_LABELS = {
+    "kauf": TransactionType.BUY, "buy": TransactionType.BUY,
+    "sparplanausführung": TransactionType.BUY,
+    "verkauf": TransactionType.SELL, "sell": TransactionType.SELL,
+    "dividende": TransactionType.DIVIDEND, "dividend": TransactionType.DIVIDEND,
+}
+
+def parse_number(raw: str, locale: str = "en") -> Decimal:
+    s = raw.strip()
+    negative = s.startswith("(") or s.startswith("-")
+    s = re.sub(r"[^\d,.]", "", s)
+    if "," in s and "." in s:
+        if s.rfind(",") > s.rfind("."):          # 1.234,56
+            s = s.replace(".", "").replace(",", ".")
+        else:                                    # 1,234.56
+            s = s.replace(",", "")
+    elif "," in s:
+        s = s.replace(",", ".") if locale == "de" else s.replace(",", "")
+    value = Decimal(s)
+    return -value if negative else value
+
+
+def parse_date(raw: str, locale: str) -> date | None:
+    text = " ".join(raw.split())                  # fixes "24 Oct\n2026"
+    for fmt in DATE_FORMATS[locale]:
+        try:
+            return datetime.strptime(text, fmt).date()
+        except ValueError:
+            pass
+    return None
+
+
+def _asset_class(fact: RawFact, doc: ExtractDocument) -> AssetClass:
+    name = f"{fact.instrument or ''} {fact.raw_label}".lower()
+    if "etf" in name:
+        return AssetClass.ETF
+    if fact.kind == "holding" and "deposit" in f"{name} {doc.doc_description}".lower():
+        return AssetClass.FIXED_DEPOSIT
+    if fact.kind == "event" and not fact.instrument:
+        return AssetClass.CASH
+    return AssetClass.OTHER
+
+
+def normalize(doc: ExtractDocument, source_text: str, account_name: str) -> ParsedStatement:
+    locale = "de" if (doc.language or "").lower() in ("de", "german", "deutsch") else "en"
+    transactions, positions, warnings = [], [], []
+
+    for fact in doc.facts:
+        if fact.kind == "balance":
+            continue                              # not stored yet
+        flags = verify_fact(fact, source_text)
+        try:
+            if not fact.amount_raw:
+                raise ValueError("missing amount")
+            amount = parse_number(fact.amount_raw, locale)
+            when = parse_date(fact.date_raw, locale) if fact.date_raw else None
+            if not fact.currency:
+                flags.append("currency_missing_assumed_EUR")
+            currency = (fact.currency or "EUR").upper()
+
+            if fact.kind == "event":
+                ttype = EVENT_LABELS.get(fact.raw_label.strip().lower())
+                if ttype is None:
+                    flags.append(f"unknown_label:{fact.raw_label}")
+                    ttype = TransactionType.UNKNOWN
+                if when is None:
+                    raise ValueError(f"unparseable date {fact.date_raw!r}")
+                transactions.append(Transaction(
+                    transaction_date=when, transaction_type=ttype,
+                    asset_class=_asset_class(fact, doc),
+                    instrument_name=fact.instrument, isin=fact.isin,
+                    quantity=parse_number(fact.quantity_raw, locale) if fact.quantity_raw else None,
+                    amount=amount, currency=currency,
+                    description=fact.evidence.quote, flags=flags))
+            else:
+                positions.append(Position(
+                    instrument_name=fact.instrument or fact.raw_label,
+                    asset_class=_asset_class(fact, doc), currency=currency,
+                    value=amount, as_of_date=when,
+                    details={a.key: a.value for a in fact.attributes},
+                    description=fact.evidence.quote, flags=flags))
+        except (ValueError, ArithmeticError) as e:   # ArithmeticError: bad number
+            warnings.append(f"Skipped '{fact.raw_label}': {e}")
+
+    return ParsedStatement(account_name=account_name, transactions=transactions,
+                           positions=positions, warnings=warnings)
+
+schemas.py>>
+
+"""
+Pydantic models: the validation contract between the parsing agent's raw
+LLM output and the database. Kept separate from models.py (SQLAlchemy)
+deliberately — this validates untrusted agent output BEFORE it's allowed
+to become a persisted row.
+"""
+
+from __future__ import annotations
+
+import hashlib
+from datetime import date
+from decimal import Decimal
+from enum import Enum
+from typing import Literal
+
+from pydantic import BaseModel, Field, field_validator
+
+class Attribute(BaseModel):
+    """Base class for all attributes that are part of a transaction record."""
+    key: str
+    value: str
+
+class Evidence(BaseModel):
+    """"Evidence for a transaction"""
+    quote: str = Field(description= "Verbatim text from the document supporting this fact")
+
+class RawFact(BaseModel):
+    kind: Literal["event", "holding", "balance"]
+    raw_label: str
+    date_raw: str | None = None
+    amount_raw: str | None = None
+    currency: str | None = None
+    quantity_raw: str | None = None
+    instrument: str | None = None
+    isin: str | None = None
+    attributes: list[Attribute] = []
+    evidence: Evidence
+
+class ExtractDocument(BaseModel):
+    doc_description: str
+    issuer: str | None = None
+    language: str | None = None
+    facts: list[RawFact]
+
+class TransactionType(str, Enum):
+    BUY = "buy"
+    SELL = "sell"
+    DIVIDEND = "dividend"
+    FEE = "fee"
+    DEPOSIT = "deposit"
+    WITHDRAWAL = "withdrawal"
+    INTEREST = "interest"
+    UNKNOWN = "unknown"
+
+
+class AssetClass(str, Enum):
+    EQUITY = "equity"
+    ETF = "etf"
+    BOND = "bond"
+    COMMODITY = "commodity"
+    CASH = "cash"
+    OTHER = "other"
+
+
+class Transaction(BaseModel):
+    transaction_date: date
+    transaction_type: TransactionType
+    asset_class: AssetClass
+    instrument_name: str | None = None
+    isin: str | None = None
+    quantity: Decimal | None = None
+    amount: Decimal = Field(description="Signed amount in the statement's currency")
+    currency: str = Field(default="EUR", min_length=3, max_length=3)
+    description: str = Field(description="Raw line item text, for audit/debugging")
+
+    @field_validator("currency")
+    @classmethod
+    def uppercase_currency(cls, v: str) -> str:
+        return v.upper()
+
+    def content_hash(self, account_name: str) -> str:
+        """Stable hash used to dedup on ingest — see models.py unique
+        constraint. account_name is passed in from the parent
+        ParsedStatement rather than stored per-transaction, since it's
+        the same value for every transaction in a statement."""
+        desc = " ".join(self.description.split()) # normalize whitespace
+        key = f"{account_name}|{self.transaction_date}|{self.amount}|{self.description}"
+        return hashlib.sha256(key.encode()).hexdigest()
+
+class Position(BaseModel):                   # new
+    instrument_name: str
+    asset_class: AssetClass
+    currency: str = Field(min_length=3, max_length=3)
+    value: Decimal = Field(description="Principal or market value")
+    as_of_date: date | None = None
+    details: dict[str, str] = {}             # maturity date, rate, ...
+    description: str = Field(description="Source quote, for audit")
+    flags: list[str] = []
+
+    def content_hash(self, account_name: str) -> str:
+        key = f"{account_name}|{self.instrument_name.strip().lower()}|{self.value:.2f}|{self.currency}|{self.as_of_date}"
+        return hashlib.sha256(key.encode()).hexdigest()    
+
+class ParsedStatement(BaseModel):
+    """Top-level structured output the parsing agent must produce."""
+
+    account_name: str
+    statement_period_start: date | None = None
+    statement_period_end: date | None = None
+    transactions: list[Transaction]
+
+verify.py>>
+
+import re
+from schemas import RawFact
+
+def _clean(s: str) -> str:
+    return re.sub(r"\s+", " ", s).strip().lower()
+
+def verify_fact(fact: RawFact, source_text: str) -> list[str]:
+    flags = []
+    if _clean(fact.evidence.quote) not in _clean(source_text):
+        flags.append(f"quote_not_found_in_source")
+    if fact.amount_raw  and fact.amount_raw.strip() not in fact.evidence.quote:
+        flags.append(f"amount_not_in_quote")
+    return flags

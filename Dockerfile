@@ -3,7 +3,7 @@
 # separate concern — deploy it as its own Container App if hosted,
 # pointing FINASSIST_API_URL at this service's URL.
 
-FROM python:3.12-slim
+FROM python:3.13-slim
 
 WORKDIR /app
 
@@ -11,6 +11,8 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY *.py .
+
+RUN mkdir -p /app/data/raw
 
 ENV PYTHONUNBUFFERED=1
 EXPOSE 8000

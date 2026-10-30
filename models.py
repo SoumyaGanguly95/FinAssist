@@ -9,25 +9,29 @@ only thing that changes between local dev (SQLite) and Azure (Azure SQL).
 
 from __future__ import annotations
 
-import os
 from contextlib import contextmanager
 from datetime import date, datetime
-
-from sqlalchemy import (
-    Date,
-    DateTime,
-    ForeignKey,
-    Numeric,
-    String,
-    UniqueConstraint,
-    create_engine,
-    func,
-)
+from decimal import Decimal
+from sqlalchemy import JSON, Date, DateTime, ForeignKey, Numeric, String, UniqueConstraint
+from sqlalchemy import create_engine, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
+
+from config import DATABASE_URL
 
 
 class Base(DeclarativeBase):
     pass
+
+
+class Conversation(Base):
+    __tablename__ = "conversations"
+
+    thread_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    title: Mapped[str] = mapped_column(String(120), default="New conversation")
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), onupdate=func.now()
+    )
 
 
 class Account(Base):
@@ -40,6 +44,22 @@ class Account(Base):
 
     transactions: Mapped[list["TransactionRecord"]] = relationship(back_populates="account")
 
+class HoldingRecord(Base):
+    __tablename__ = "holdings"
+    __table_args__ = (UniqueConstraint("content_hash", name="uq_holding_content_hash"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    account_id: Mapped[int] = mapped_column(ForeignKey("accounts.id"))
+    instrument_name: Mapped[str] = mapped_column(String(255))
+    asset_class: Mapped[str] = mapped_column(String(20))
+    currency: Mapped[str] = mapped_column(String(3))
+    value: Mapped[Decimal] = mapped_column(Numeric(18, 2))
+    as_of_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    details: Mapped[dict] = mapped_column(JSON, default=dict)
+    description: Mapped[str] = mapped_column(String(500))
+    content_hash: Mapped[str] = mapped_column(String(64), index=True)
+    source_file: Mapped[str] = mapped_column(String(500))
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
 class TransactionRecord(Base):
     __tablename__ = "transactions"
@@ -62,12 +82,6 @@ class TransactionRecord(Base):
 
     account: Mapped["Account"] = relationship(back_populates="transactions")
 
-
-# --- session setup -----------------------------------------------------
-# Local dev:  DATABASE_URL=sqlite:///data/finassist.db
-# Azure:      DATABASE_URL=mssql+pyodbc://<user>:<pass>@<server>.database.windows.net/finassist?driver=ODBC+Driver+18+for+SQL+Server
-
-DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///data/finassist.db")
 engine = create_engine(DATABASE_URL, echo=False)
 SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
 

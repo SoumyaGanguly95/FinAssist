@@ -30,7 +30,7 @@ finassist/
 ├── models.py               # SQLAlchemy models + DB session (SQLite locally, swaps to Azure SQL via DATABASE_URL)
 ├── agents.py                 # ALL agent logic: parsing agent + insight agent + its tools
 ├── ingest.py                   # extract_text() + ingest_statement() (parse) + commit_parsed_statement() (save)
-├── app.py                        # FastAPI service: /ingest, /ingest/commit, /ask, /health
+├── app.py                        # FastAPI service: ingestion, conversations, chat, health
 ├── dashboard.py                    # thin Streamlit client — calls the API, contains no logic
 ├── scripts/
 │   ├── init_db.py                    # one-time/idempotent: creates SQLite tables
@@ -82,24 +82,39 @@ ingest.py  commit_parsed_statement()
 models.py  → SQLite (data/finassist.db)
 ```
 
-### Flow 2 — Ask a question
+### Flow 2 — Chat with portfolio data
 
 ```
-Client (dashboard.py "Ask" tab)
-        │  question text
+Client (dashboard.py "Portfolio chat" tab)
+        │  select an existing conversation or create one
+        │  send a new message + conversation thread_id
         ▼
-app.py  GET /ask
+app.py  POST /conversations, GET /conversations[/{thread_id}], POST /ask
         ▼
 agents.py  run_insight_query()
-        │  create_agent(model=..., tools=[query_holdings, get_portfolio_valuation, flag_anomaly])
+        │  create_agent(..., checkpointer=SQLite saver)
+        │  one new user message + thread_id
         │  THIS is where LangGraph's loop actually runs: the model decides
         │  which tool(s) to call, inspects the result, decides again if needed
         ▼
 tools query models.py directly (SQLAlchemy) — the agent never sees raw SQL,
 only what each tool function returns as a string
+        │  available queries: imported transactions, saved position snapshots,
+        │  net cash flow grouped by currency
         ▼
-Final assistant message → returned as the answer
+LangGraph saves thread state in data/finassist_checkpoints.sqlite
+        ▼
+Final assistant message → returned to dashboard and displayed in chat
 ```
+
+The dashboard keeps the visible transcript in Streamlit session state. The API
+uses the thread ID with a SQLite checkpointer to retain agent state across turns
+and API restarts. This MVP has no authentication, so it is intended for a
+single local user; a multi-user deployment must authorize thread access. Saved
+conversations can be reopened through the dashboard's conversation selector.
+For container deployments, persist the `data/` directory; otherwise database
+and conversation state can be lost when the container is replaced. Do not run
+multiple API replicas against local SQLite files.
 
 **Why two different agent patterns:** the parsing agent needs zero reasoning — text in, structured data out, so a single `response_format` call is enough. The insight agent genuinely doesn't know in advance which data it needs, so it needs the tool-calling loop. Using the heavier pattern for both would be over-engineering the parsing side; using the lighter pattern for insight would make it unable to actually answer varied questions.
 
@@ -109,9 +124,7 @@ Final assistant message → returned as the answer
 
 ```bash
 git clone <repo-url> && cd finassist
-uv init --name finassist --python 3.12
-uv add langchain langchain-openai langgraph fastapi "uvicorn[standard]" pydantic sqlalchemy pdfplumber yfinance streamlit requests python-dotenv
-uv add --dev pytest ruff
+uv sync --extra dashboard  # include the Streamlit client
 
 cp .env.example .env
 # fill in OPENAI_API_KEY (from platform.openai.com — separate from any ChatGPT subscription)
@@ -123,6 +136,14 @@ uv run uvicorn app:app --reload
 
 # Terminal 2
 uv run streamlit run dashboard.py
+```
+
+`pyproject.toml` is the dependency source of truth. `uv.lock` pins the
+development environment; `requirements.txt` is the generated, production-only
+API dependency list used by Docker. Regenerate it after dependency changes:
+
+```bash
+uv export --no-dev --format requirements-txt --no-hashes --output-file requirements.txt
 ```
 
 Fast local iteration loop (no API/UI needed) while tuning the parsing prompt:
@@ -141,6 +162,7 @@ uv run python scripts/cli_ingest.py data/raw/statement.csv --account "Trade Repu
 - **`Transaction.account_name` was a schema design bug**, not a prompt problem — it asked the LLM for a field that was redundant with `ParsedStatement.account_name` and was never actually read downstream. Removed entirely rather than prompted around. General lesson: a structured-output validation failure is worth checking against the schema itself before assuming it's a prompt/model problem.
 - **No Alembic migrations yet** — `models.py`'s `init_db()` uses `create_all()`, fine for MVP, not safe for schema changes against real persisted data.
 - **Model provider strings need re-verification before each session** — LangChain's model integration strings (`"openai:..."` vs `"azure_openai:..."`) and provider requirements (e.g. Azure requiring `OPENAI_API_VERSION`) change with library updates; don't assume last session's working string is still correct after an upgrade.
+- **Chat tools report stored facts, not investment performance** — transaction amounts are net cash flow by currency, and position values are statement snapshots. Current market value, returns, and profit/loss are not computed by this MVP.
 
 ---
 
