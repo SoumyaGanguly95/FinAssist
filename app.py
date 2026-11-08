@@ -21,6 +21,7 @@ from sqlalchemy import func, select, update
 from agents import get_insight_conversation, run_insight_query
 from config import CHECKPOINT_DATABASE_PATH
 from ingest import commit_parsed_statement, ingest_statement
+from market import get_quote_snapshot, get_watchlist_snapshot
 from models import Conversation, get_session, init_db
 from schemas import ParsedStatement
 
@@ -163,6 +164,16 @@ def ask(payload: ChatRequest):
         "thread_id": thread_id,
         "answer": answer,
     }
+
+
+@app.get("/market/watchlist")
+def market_watchlist() -> dict:
+    return get_watchlist_snapshot()
+
+
+@app.get("/market/quote/{symbol}")
+def market_quote(symbol: str) -> dict:
+    return get_quote_snapshot(symbol)
 
 
 @app.get("/health")

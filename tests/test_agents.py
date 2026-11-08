@@ -8,6 +8,7 @@ from datetime import date
 from types import SimpleNamespace
 
 import agents
+import ingest
 import models
 from langchain_core.language_models.fake_chat_models import FakeListChatModel
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
@@ -120,6 +121,44 @@ def test_query_transactions_applies_date_and_instrument_filters(monkeypatch, tmp
     assert "2026-01-15" in result
     assert "2025-12-15" not in result
     assert "Other fund" not in result
+
+
+def test_commit_parsed_statement_skips_duplicate_transactions_in_same_batch(monkeypatch, tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'transactions.sqlite'}")
+    models.Base.metadata.create_all(engine)
+    monkeypatch.setattr(models, "SessionLocal", sessionmaker(bind=engine))
+
+    payload = ParsedStatement(
+        account_name="Broker",
+        transactions=[
+            Transaction(
+                transaction_date="2026-01-15",
+                transaction_type=TransactionType.BUY,
+                asset_class=AssetClass.ETF,
+                amount=-100.00,
+                currency="EUR",
+                description="Buy VWCE",
+            ),
+            Transaction(
+                transaction_date="2026-01-15",
+                transaction_type=TransactionType.BUY,
+                asset_class=AssetClass.ETF,
+                amount=-100.00,
+                currency="EUR",
+                description="Buy VWCE",
+            ),
+        ],
+        positions=[],
+    )
+
+    result = ingest.commit_parsed_statement(payload, "statement.csv")
+
+    assert result == {
+        "inserted": 1,
+        "skipped_duplicates": 1,
+        "holdings_inserted": 0,
+        "holdings_skipped": 0,
+    }
 
 
 def test_chat_thread_history_survives_checkpointer_reopen(tmp_path):

@@ -12,7 +12,6 @@ Azure Function triggered by Blob Storage — only the trigger changes.
 
 from __future__ import annotations
 
-import hashlib
 from pathlib import Path
 
 import pdfplumber
@@ -90,13 +89,11 @@ def commit_parsed_statement(parsed: ParsedStatement, source_file: str) -> dict:
         existing = {r[0] for r in session.execute(
             select(TransactionRecord.content_hash).where(TransactionRecord.account_id == account.id)
         ).all()}
-        seen: dict[str, int] = {}
+        seen_hashes: set[str] = set()
 
         for txn in parsed.transactions:
-            base = txn.content_hash(parsed.account_name)
-            seen[base] = seen.get(base, 0) + 1
-            content_hash = hashlib.sha256(f"{base}|{seen[base]}".encode()).hexdigest()
-            if content_hash in existing:
+            content_hash = txn.content_hash(parsed.account_name)
+            if content_hash in existing or content_hash in seen_hashes:
                 skipped += 1
                 continue
             session.add(TransactionRecord(
@@ -113,6 +110,8 @@ def commit_parsed_statement(parsed: ParsedStatement, source_file: str) -> dict:
                 content_hash=content_hash,
                 source_file=source_file,
             ))
+            existing.add(content_hash)
+            seen_hashes.add(content_hash)
             inserted += 1
 
         existing_holdings = {r[0] for r in session.execute(

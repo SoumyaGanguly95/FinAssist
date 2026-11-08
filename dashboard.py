@@ -34,7 +34,7 @@ def text_to_details(text: str | None) -> list[dict]:
 st.set_page_config(page_title="FinAssist", layout="wide")
 st.title("FinAssist")
 
-tab_ingest, tab_ask = st.tabs(["Ingest statement", "Portfolio chat"])
+tab_ingest, tab_ask, tab_market = st.tabs(["Ingest statement", "Portfolio chat", "Market watchlist"])
 
 with tab_ingest:
     uploaded = st.file_uploader("Upload a statement (PDF or CSV)", type=["pdf", "csv"])
@@ -193,5 +193,39 @@ with tab_ask:
                     st.error(f"API error ({api_response.status_code}): {detail}")
             except (requests.RequestException, ValueError, KeyError) as e:
                 st.error(f"Could not complete the chat request: {e}")
-            else:
+
+with tab_market:
+    st.caption("Yahoo Finance pricing for the configured instrument watchlist.")
+    try:
+        response = requests.get(f"{API_BASE}/market/watchlist", timeout=30)
+        response.raise_for_status()
+        payload = response.json()
+    except (requests.RequestException, ValueError, KeyError) as exc:
+        st.error(f"Could not load market watchlist: {exc}")
+        payload = {"watchlist": []}
+
+    rows = []
+    for item in payload.get("watchlist", []):
+        quote = item.get("quote") or {}
+        forecast = item.get("forecast") or {}
+        rows.append(
+            {
+                "Name": item.get("name"),
+                "Ticker": item.get("ticker") or "—",
+                "ISIN": item.get("isin") or "—",
+                "Asset": item.get("asset_type") or "—",
+                "Price": quote.get("price"),
+                "Currency": quote.get("currency") or item.get("currency") or "—",
+                "Day change %": quote.get("day_change_pct"),
+                "Forecast 30d %": forecast.get("expected_return_pct"),
+                "Signal": forecast.get("signal") or "—",
+                "Status": item.get("status", "ok"),
+            }
+        )
+
+    if rows:
+        st.dataframe(pd.DataFrame(rows), width="stretch")
+    else:
+        st.info("No watchlist instruments are configured yet.")
+          else:
                 st.rerun()

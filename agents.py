@@ -208,7 +208,7 @@ def get_net_cash_flow() -> str:
 INSIGHT_TOOLS = [query_transactions, get_net_cash_flow, query_positions]
 
 # --- Insight agent --------------------------------------------------------
-# Multi-step, tool-calling agent — this is the piece that actually needs
+# Multi-step, tool-calling agent — this code block requires
 # LangGraph's loop (decide which tool to call, inspect result, decide again).
 
 INSIGHT_SYSTEM_PROMPT = """You are a financial data assistant for a
