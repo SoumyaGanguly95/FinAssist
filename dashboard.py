@@ -227,5 +227,3 @@ with tab_market:
         st.dataframe(pd.DataFrame(rows), width="stretch")
     else:
         st.info("No watchlist instruments are configured yet.")
-          else:
-                st.rerun()
