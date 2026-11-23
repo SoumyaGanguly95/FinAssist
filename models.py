@@ -13,7 +13,7 @@ from contextlib import contextmanager
 from datetime import date, datetime
 from decimal import Decimal
 from sqlalchemy import JSON, Date, DateTime, ForeignKey, Numeric, String, UniqueConstraint
-from sqlalchemy import create_engine, func
+from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
 
 from config import DATABASE_URL
@@ -61,6 +61,7 @@ class HoldingRecord(Base):
     source_file: Mapped[str] = mapped_column(String(500))
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
+
 class TransactionRecord(Base):
     __tablename__ = "transactions"
     __table_args__ = (UniqueConstraint("content_hash", name="uq_transaction_content_hash"),)
@@ -81,6 +82,33 @@ class TransactionRecord(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
     account: Mapped["Account"] = relationship(back_populates="transactions")
+
+
+def latest_holding_statement():
+    ranked_holdings = select(
+        HoldingRecord.id.label("holding_id"),
+        func.row_number()
+        .over(
+            partition_by=(
+                HoldingRecord.account_id,
+                func.lower(func.trim(HoldingRecord.instrument_name)),
+            ),
+            order_by=(
+                HoldingRecord.as_of_date.desc(),
+                HoldingRecord.created_at.desc(),
+                HoldingRecord.id.desc(),
+            ),
+        )
+        .label("position_rank"),
+    ).subquery()
+    return (
+        select(HoldingRecord, Account.name.label("account_name"))
+        .join(Account, HoldingRecord.account_id == Account.id)
+        .join(ranked_holdings, ranked_holdings.c.holding_id == HoldingRecord.id)
+        .where(ranked_holdings.c.position_rank == 1)
+        .order_by(Account.name, HoldingRecord.instrument_name)
+    )
+
 
 engine = create_engine(DATABASE_URL, echo=False)
 SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)

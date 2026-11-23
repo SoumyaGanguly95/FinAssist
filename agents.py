@@ -11,6 +11,7 @@ https://docs.langchain.com/oss/python/langchain/agents
 
 from __future__ import annotations
 
+import json
 from datetime import date
 
 from langchain.agents import create_agent
@@ -19,7 +20,8 @@ from langchain.tools import tool
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from sqlalchemy import func, select
 
-from models import get_session, Account, TransactionRecord, HoldingRecord
+from market import get_watchlist_snapshot
+from models import get_session, Account, TransactionRecord, latest_holding_statement
 from schemas import ExtractDocument
 
 # --- Parsing agent -------------------------------------------------------
@@ -122,14 +124,10 @@ def extract_document(raw_text: str, account_hint: str | None = None) -> ExtractD
 @tool
 def query_positions(account_name: str | None = None) -> str:
     """Return position snapshots recorded from imported statements. These are
-    reported values, optionally filtered to an account. They are not live
-    market prices or necessarily the latest value."""
+    the latest reported value for each instrument, optionally filtered to an
+    account. They are not live market prices."""
     with get_session() as session:
-        stmt = (
-            select(HoldingRecord, Account.name.label("account_name"))
-            .join(Account, HoldingRecord.account_id == Account.id)
-            .order_by(HoldingRecord.as_of_date.desc(), HoldingRecord.id.desc())
-        )
+        stmt = latest_holding_statement()
         if account_name:
             stmt = stmt.where(Account.name == account_name)
         rows = session.execute(stmt).all()
@@ -141,6 +139,14 @@ def query_positions(account_name: str | None = None) -> str:
             f"{position.details}"
             for position, account in rows
         )
+
+
+@tool
+def query_market_watchlist() -> str:
+    """Fetch external market quotes and available 30-day watchlist trend
+    projections from Yahoo Finance. Use for questions about current prices,
+    market trends, or watchlist forecasts."""
+    return json.dumps(get_watchlist_snapshot())
 
 
 @tool
@@ -205,7 +211,12 @@ def get_net_cash_flow() -> str:
         )
 
 
-INSIGHT_TOOLS = [query_transactions, get_net_cash_flow, query_positions]
+INSIGHT_TOOLS = [
+    query_transactions,
+    get_net_cash_flow,
+    query_positions,
+    query_market_watchlist,
+]
 
 # --- Insight agent --------------------------------------------------------
 # Multi-step, tool-calling agent — this code block requires
@@ -219,6 +230,12 @@ Position values are snapshots from uploaded statements, not live market
 prices. Net cash flow is not portfolio value, return, or profit/loss. Never
 combine amounts across currencies. This is not financial advice; frame
 recommendations as neutral information, not directives.
+For questions about live prices or market-watchlist forecasts, use the
+query_market_watchlist tool. Its 30-day forecasts are simple linear-trend
+projections from recent historical prices, not reliable predictions or
+guarantees. Identify the source and horizon, and state when a ticker is
+unresolved or market data is unavailable. Do not present a projection as a
+holding's reported value.
 """
 
 

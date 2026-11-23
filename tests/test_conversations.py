@@ -1,3 +1,5 @@
+from datetime import date
+
 import app as api
 import models
 from fastapi.testclient import TestClient
@@ -67,3 +69,58 @@ def test_conversation_routes_create_resume_and_reject_unknown_thread(
             },
         )
         assert unknown.status_code == 404
+
+
+def test_portfolio_positions_returns_latest_snapshot_and_details(monkeypatch, tmp_path):
+    database_engine = create_engine(f"sqlite:///{tmp_path / 'portfolio.sqlite'}")
+    monkeypatch.setattr(models, "SessionLocal", sessionmaker(bind=database_engine))
+    monkeypatch.setattr(
+        api,
+        "init_db",
+        lambda: models.Base.metadata.create_all(database_engine),
+    )
+    monkeypatch.setattr(
+        api,
+        "CHECKPOINT_DB_PATH",
+        tmp_path / "portfolio-checkpoints.sqlite",
+    )
+
+    with TestClient(api.app) as client:
+        with models.get_session() as session:
+            account = models.Account(name="Broker")
+            session.add(account)
+            session.flush()
+            for position_date, value in [
+                (date(2025, 1, 1), 100),
+                (date(2026, 1, 1), 150),
+            ]:
+                session.add(
+                    models.HoldingRecord(
+                        account_id=account.id,
+                        instrument_name="Example ETF",
+                        asset_class="etf",
+                        currency="EUR",
+                        value=value,
+                        as_of_date=position_date,
+                        details={"units": "3"},
+                        description="Statement position",
+                        content_hash=f"example-{position_date}",
+                        source_file="statement.csv",
+                    )
+                )
+
+        response = client.get("/portfolio/positions")
+
+    assert response.status_code == 200
+    assert response.json()["positions"] == [
+        {
+            "account_name": "Broker",
+            "instrument_name": "Example ETF",
+            "asset_class": "etf",
+            "currency": "EUR",
+            "value": "150.00",
+            "as_of_date": "2026-01-01",
+            "details": {"units": "3"},
+            "description": "Statement position",
+        }
+    ]

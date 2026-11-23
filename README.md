@@ -27,7 +27,7 @@ FinAssist is a single-user personal-finance project for extracting transactions 
 - Review warnings and edit, add, or remove extracted rows before committing them.
 - Save confirmed records with account and source-file references; use content hashes to skip duplicate transaction and position records.
 - Chat with saved records through a LangGraph agent with narrowly defined tools for transaction search, position snapshots, and net cash flow.
-- Monitor a configurable market watchlist with Yahoo Finance pricing and a simple 30-day directional forecast layer for selected instruments.
+- Monitor a configurable market watchlist with Yahoo Finance pricing, a simple 30-day trend projection for selected instruments, and six-month/one-year linear-trend projections for EUWAX Gold II.
 - Persist conversation metadata in the application database and conversational state in a separate SQLite checkpointer.
 - Run statement ingestion from a command-line interface, either as a dry run or with an explicit `--commit`.
 
@@ -191,6 +191,9 @@ Interactive request/response schemas are available at `http://localhost:8000/doc
 | `GET` | `/conversations` | List saved conversations, most recently updated first. |
 | `GET` | `/conversations/{thread_id}` | Retrieve a conversation and its user-facing messages. |
 | `POST` | `/ask` | Submit a message for an existing conversation. The JSON body contains `message` and `thread_id`. Messages must contain 1–4,000 non-whitespace characters; the thread ID must be a UUID. |
+| `GET` | `/portfolio/positions` | Return the latest imported position snapshot for each instrument and account, including statement details. |
+| `GET` | `/market/watchlist` | Return Yahoo Finance quotes and configured 30-day trend projections for resolved watchlist tickers. |
+| `GET` | `/market/quote/{symbol}` | Return a Yahoo Finance quote snapshot for a ticker. |
 | `GET` | `/health` | Return the basic service status response. |
 
 Example: upload a statement for parsing. The response includes the parsed data and the generated source-file path; it does not commit the records.

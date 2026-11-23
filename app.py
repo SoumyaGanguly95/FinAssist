@@ -22,7 +22,7 @@ from agents import get_insight_conversation, run_insight_query
 from config import CHECKPOINT_DATABASE_PATH
 from ingest import commit_parsed_statement, ingest_statement
 from market import get_quote_snapshot, get_watchlist_snapshot
-from models import Conversation, get_session, init_db
+from models import Conversation, get_session, init_db, latest_holding_statement
 from schemas import ParsedStatement
 
 
@@ -169,6 +169,27 @@ def ask(payload: ChatRequest):
 @app.get("/market/watchlist")
 def market_watchlist() -> dict:
     return get_watchlist_snapshot()
+
+
+@app.get("/portfolio/positions")
+def portfolio_positions() -> dict:
+    with get_session() as session:
+        rows = session.execute(latest_holding_statement()).all()
+        return {
+            "positions": [
+                {
+                    "account_name": account_name,
+                    "instrument_name": position.instrument_name,
+                    "asset_class": position.asset_class,
+                    "currency": position.currency,
+                    "value": position.value,
+                    "as_of_date": position.as_of_date,
+                    "details": position.details,
+                    "description": position.description,
+                }
+                for position, account_name in rows
+            ]
+        }
 
 
 @app.get("/market/quote/{symbol}")

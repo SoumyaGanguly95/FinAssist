@@ -4,6 +4,7 @@ statement and know what its actual output shape looks like. Writing
 detailed tests before that would just be testing guesses.
 """
 
+import json
 from datetime import date
 from types import SimpleNamespace
 
@@ -65,6 +66,15 @@ def test_insight_query_passes_message_thread_and_checkpointer(monkeypatch):
         {"role": "user", "content": "What positions do I have?"}
     ]
     assert captured["config"]["configurable"]["thread_id"] == "conversation-123"
+
+
+def test_query_market_watchlist_returns_external_snapshot(monkeypatch):
+    snapshot = {"watchlist": [{"ticker": "AAPL", "forecast": {"signal": "bullish"}}]}
+    monkeypatch.setattr(agents, "get_watchlist_snapshot", lambda: snapshot)
+
+    result = agents.query_market_watchlist.invoke({})
+
+    assert json.loads(result) == snapshot
 
 
 def test_conversation_messages_hide_tool_exchanges():

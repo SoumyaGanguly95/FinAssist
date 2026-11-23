@@ -23,6 +23,13 @@ POS_COLS = ["instrument_name", "asset_class", "currency", "value", "as_of_date",
             "reference", "details", "description"]
 
 
+@st.cache_data(ttl="30s", max_entries=2)
+def load_portfolio_positions(api_base: str) -> list[dict]:
+    response = requests.get(f"{api_base}/portfolio/positions", timeout=30)
+    response.raise_for_status()
+    return response.json()["positions"]
+
+
 def details_to_text(details: list[dict]) -> str:
     return json.dumps({d["key"]: d["value"] for d in details})
 
@@ -115,6 +122,94 @@ with tab_ingest:
                 st.error(commit_resp.text)
 
 with tab_ask:
+    st.subheader("Portfolio overview")
+    st.caption(
+        "Latest imported position snapshot by account and instrument. "
+        "Reported values are not live market prices."
+    )
+    if st.button("Refresh positions", icon=":material/refresh:"):
+        load_portfolio_positions.clear()
+
+    try:
+        portfolio_positions = load_portfolio_positions(API_BASE)
+    except (requests.RequestException, ValueError, KeyError) as e:
+        st.error(f"Could not load portfolio positions: {e}")
+        portfolio_positions = None
+
+    if portfolio_positions:
+        positions_df = pd.DataFrame(portfolio_positions)
+        positions_df["value"] = pd.to_numeric(positions_df["value"], errors="raise")
+        account_names = sorted(positions_df["account_name"].dropna().unique())
+        selected_account = st.selectbox(
+            "Account",
+            options=["All accounts", *account_names],
+            key="portfolio_account",
+        )
+        if selected_account != "All accounts":
+            positions_df = positions_df[positions_df["account_name"] == selected_account]
+
+        with st.container(horizontal=True):
+            st.metric("Positions", len(positions_df), border=True)
+            for currency, total in positions_df.groupby("currency")["value"].sum().items():
+                st.metric(f"Reported value ({currency})", f"{total:,.2f} {currency}", border=True)
+
+        currencies = sorted(positions_df["currency"].dropna().unique())
+        if currencies:
+            if len(currencies) > 1:
+                chart_currency = st.selectbox(
+                    "Allocation currency",
+                    options=currencies,
+                    key="portfolio_chart_currency",
+                )
+            else:
+                chart_currency = currencies[0]
+            allocation = (
+                positions_df[positions_df["currency"] == chart_currency]
+                .groupby("asset_class", as_index=False)["value"]
+                .sum()
+                .rename(columns={"asset_class": "Asset class", "value": "Reported value"})
+            )
+            st.bar_chart(allocation, x="Asset class", y="Reported value")
+
+        detail_rows = positions_df.rename(
+            columns={
+                "account_name": "Account",
+                "instrument_name": "Position",
+                "asset_class": "Asset class",
+                "currency": "Currency",
+                "value": "Reported value",
+                "as_of_date": "As of",
+                "description": "Statement description",
+            }
+        ).copy()
+        detail_rows["details"] = detail_rows["details"].apply(
+            lambda details: json.dumps(details or {}, sort_keys=True)
+        )
+        detail_rows = detail_rows.rename(columns={"details": "Details"})
+        st.dataframe(
+            detail_rows[
+                [
+                    "Account",
+                    "Position",
+                    "Asset class",
+                    "Reported value",
+                    "Currency",
+                    "As of",
+                    "Details",
+                    "Statement description",
+                ]
+            ],
+            column_config={
+                "Reported value": st.column_config.NumberColumn(format="%.2f"),
+            },
+            hide_index=True,
+        )
+    elif portfolio_positions == []:
+        st.info("No imported positions are available yet. Upload and confirm a statement to get started.")
+
+    st.divider()
+    st.subheader("Ask a follow-up")
+    st.caption("Ask about your imported portfolio, transactions, or market-watchlist prices and forecasts.")
     try:
         conversations_response = requests.get(f"{API_BASE}/conversations", timeout=15)
         conversations_response.raise_for_status()
@@ -195,7 +290,10 @@ with tab_ask:
                 st.error(f"Could not complete the chat request: {e}")
 
 with tab_market:
-    st.caption("Yahoo Finance pricing for the configured instrument watchlist.")
+    st.caption(
+        "Yahoo Finance quotes and trend projections for the configured watchlist. "
+        "Projections are illustrative, not financial advice."
+    )
     try:
         response = requests.get(f"{API_BASE}/market/watchlist", timeout=30)
         response.raise_for_status()
@@ -227,3 +325,53 @@ with tab_market:
         st.dataframe(pd.DataFrame(rows), width="stretch")
     else:
         st.info("No watchlist instruments are configured yet.")
+
+    gold_item = next(
+        (
+            item
+            for item in payload.get("watchlist", [])
+            if item.get("isin") == "DE000EWG2LD7"
+        ),
+        None,
+    )
+    if gold_item:
+        st.subheader("EUWAX Gold II midterm outlook")
+        quote = gold_item.get("quote") or {}
+        midterm_forecast = gold_item.get("midterm_forecast") or {}
+        horizons = midterm_forecast.get("horizons") or {}
+        if gold_item.get("status") != "ok":
+            st.warning("A midterm outlook is unavailable because the market quote could not be loaded.")
+        elif not horizons:
+            st.info("A midterm outlook is unavailable for this instrument.")
+        else:
+            st.caption(
+                "Trend extrapolation from five years of daily Yahoo Finance prices; "
+                "each horizon is measured in trading sessions. This is not an ML "
+                "model, a confidence interval, or an investment recommendation."
+            )
+            outlook_rows = [
+                {
+                    "Horizon": horizon,
+                    "Trading sessions": values["trading_days"],
+                    "Projected price": values["projected_price"],
+                    "Currency": values["currency"],
+                    "Projected change %": values["expected_return_pct"],
+                    "Trend direction": values["trend"],
+                }
+                for horizon, values in horizons.items()
+            ]
+            st.caption(
+                f"Latest quote: {quote.get('price', '—')} "
+                f"{quote.get('currency', '')} · "
+                f"Projection method: {midterm_forecast.get('method', '—')}"
+            )
+            st.dataframe(
+                pd.DataFrame(outlook_rows),
+                column_config={
+                    "Projected price": st.column_config.NumberColumn(format="%.2f"),
+                    "Projected change %": st.column_config.NumberColumn(
+                        format="%.2f%%"
+                    ),
+                },
+                hide_index=True,
+            )
